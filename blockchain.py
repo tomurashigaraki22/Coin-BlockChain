@@ -4,6 +4,7 @@ import sqlite3
 import hashlib
 import json
 import string
+import jwt
 import random
 import threading
 
@@ -29,6 +30,7 @@ c.execute('''CREATE TABLE IF NOT EXISTS blockchain_transactions (
 conn.commit()
 
 mining_in_progress = False
+app.config['mining_thread'] = None
 
 class Blockchain:
     def __init__(self):
@@ -87,45 +89,51 @@ class Blockchain:
         self.save_block_to_db(block)
         return block
 
-    def new_transaction(self, sender, recipient, amount):
+    def new_transaction(self, sender, recipient, amount, username):
         # Connect to the database
         conn = sqlite3.connect('./database.db')
         c = conn.cursor()
 
-        # Check if the sender exists in the accounts table
-        c.execute('SELECT balance FROM accounts WHERE senderName = ?', (sender,))
-        sender_balance = c.fetchone()
+        c.execute('SELECT * FROM accounts WHERE address = ?', (recipient,))
+        rec_found = c.fetchone()
+        if rec_found:
 
-        # Check if the sender exists and has sufficient balance
-        if sender_balance and int(sender_balance[0]) >= amount:
-            # Create the transaction
-            transaction_data = {
-                "sender": sender,
-                "recipient": recipient,
-                "amount": amount,
-            }
-            self.current_transactions.append(transaction_data)
+            # Check if the sender exists in the accounts table
+            c.execute('SELECT balance FROM accounts WHERE senderName = ?', (sender,))
+            sender_balance = c.fetchone()
 
-            # Convert the current_transactions list to a JSON string
-            transactions_json = json.dumps(self.current_transactions)
-            character = string.ascii_lowercase
-            characters = string.ascii_lowercase + string.digits
-            unique_id = str(int(time())) + ''.join(random.choice(characters) for _ in range(20))
-            # Insert the JSON string into the blockchain_transactions table
-            c.execute('INSERT INTO blockchain_transactions (transactions, timestamp, uniqueId) VALUES (?, ?, ?)', (transactions_json, time(), unique_id))
+            # Check if the sender exists and has sufficient balance
+            if sender_balance and int(sender_balance[0]) >= amount:
+                # Create the transaction
+                transaction_data = {
+                    "sender": sender,
+                    "recipient": recipient,
+                    "amount": amount,
+                }
+                self.current_transactions.append(transaction_data)
 
-            # Deduct the amount from the sender's balance
-            c.execute('UPDATE accounts SET balance = balance - ? WHERE senderName = ?', (amount, sender))
+                # Convert the current_transactions list to a JSON string
+                transactions_json = json.dumps(self.current_transactions)
+                character = string.ascii_lowercase
+                characters = string.ascii_lowercase + string.digits
+                unique_id = str(int(time())) + ''.join(random.choice(characters) for _ in range(20))
+                # Insert the JSON string into the blockchain_transactions table
+                c.execute('INSERT INTO blockchain_transactions (transactions, timestamp, uniqueId, username) VALUES (?, ?, ?, ?)', (transactions_json, time(), unique_id, username))
 
-            # Add the amount to the recipient's balance
-            c.execute('UPDATE accounts SET balance = balance + ? WHERE senderName = ?', (amount, recipient))
+                # Deduct the amount from the sender's balance
+                c.execute('UPDATE accounts SET balance = balance - ? WHERE senderName = ?', (amount, sender))
 
-            # Commit the changes to the database
-            conn.commit()
+                # Add the amount to the recipient's balance
+                c.execute('UPDATE accounts SET balance = balance + ? WHERE senderName = ?', (amount, recipient))
 
-            return self.last_block["id"] + 1 if self.last_block else 1
+                # Commit the changes to the database
+                conn.commit()
+
+                return self.last_block["id"] + 1 if self.last_block else 1
+            else:
+                return jsonify({'status': 404, 'message': 'Insufficient Balance'})
         else:
-            return -1  # Insufficient balance or sender not found
+            return jsonify({ 'status': 404, 'message': 'Recipient Not Found'})
 
         
     def proof_of_work(self, last_proof):
@@ -135,7 +143,7 @@ class Blockchain:
         return proof
 
     @staticmethod
-    def valid_proof(last_proof, proof, difficulty=5):
+    def valid_proof(last_proof, proof, difficulty=8):
         guess = f"{last_proof}{proof}".encode()
         guess_hash = hashlib.sha256(guess).hexdigest()
         return guess_hash[:difficulty] == "0" * difficulty
@@ -148,7 +156,31 @@ class Blockchain:
     def last_block(self):
         return self.chain[-1]
     
-    
+@app.route('/login', methods=['POST'])
+def login():
+    username = request.form.get('username')
+    password = request.form.get('password')
+    conn = sqlite3.connect('./database.db')
+    c = conn.cursor()
+
+    c.execute('SELECT * FROM accounts WHERE senderName = ?', (username,))
+    row = c.fetchone()
+    if row:
+        print(row)
+        print(row[4])
+        if password == row[4]:
+            payload = {
+                'username': row[1],
+                'password': row[4],
+                'address': row[2]
+            }
+            jwt_token = jwt.encode(payload, app.secret_key, algorithm='HS256')
+
+            return jsonify({'message':'Login Successful', 'status': 200, 'token': jwt_token})
+        else:
+            return jsonify({'message': 'Login Unsuccessful', 'status': 404})
+    else:
+        return jsonify({'message': 'User does not exist', 'status': 404})
 
 @app.route('/signup', methods=['POST'])
 def signup():
@@ -178,8 +210,14 @@ def signup():
     # Store the password as plain text
     c.execute('INSERT INTO accounts (senderName, address, balance, password) VALUES (?, ?, ?, ?)', (username, random_string, 1000, password))
     conn.commit()
+    payload = {
+            'username': username,
+            'password': password,
+            'address': random_string
+        }
+    jwt_token = jwt.encode(payload, app.secret_key, algorithm='HS256')
 
-    return jsonify({'message': 'User registered successfully', 'status': 201, 'address': random_string})
+    return jsonify({'message': 'User registered successfully', 'status': 200, 'address': random_string, 'token': jwt_token})
 
 @app.route('/new_transaction', methods=['POST'])
 def new_transaction():
@@ -204,7 +242,7 @@ def new_transaction():
     blockchain = Blockchain()
 
     # Call the new_transaction method on the blockchain instance
-    blockchain.new_transaction(sender, recipient, amount)
+    blockchain.new_transaction(sender, recipient, amount, sender)
 
     return jsonify({'message': 'Transaction added to the blockchain', 'status': 200, 'sender_addr': sender_addr})
 
@@ -252,12 +290,57 @@ def mine():
             conn.close()  # Close the database connection when mining is finished
 
         mining_thread = threading.Thread(target=mine_block)
+        app.config['mining_thread'] = mining_thread  # Store the thread in the app's configuration
         mining_thread.start()
         return jsonify({'message': 'Mining started', 'status': 200, 'balance': balance})
     else:
         return jsonify({'message': 'Mining is already in progress', 'status': 400})
 
+    
+@app.route('/getData', methods=['POST'])
+def getData():
+    username = request.form.get('username')
+    password = request.form.get('password')
+    conn = sqlite3.connect('./database.db')
+    c = conn.cursor()
+
+    c.execute('SELECT * FROM accounts WHERE senderName = ?', (username,))
+    row = c.fetchone()
+    if row:
+        return jsonify({'balance': row[3], 'status': 200, 'address': row[2]})
+    else:
+        return jsonify({'status': 404, 'balance': None, 'address': None})
+    
+@app.route('/getTransactions', methods=['POST'])
+def getTransactions():
+    username = request.form.get('username')
+    password = request.form.get('password')
+    conn = sqlite3.connect('./database.db')
+    c = conn.cursor()
+
+    c.execute('SELECT transactions FROM blockchain_transactions WHERE username = ?', ('portable',))
+    row = c.fetchone()
+    
+    if row:
+        transactions_data = json.loads(row[0])  # Parse the JSON data
+        return jsonify(transactions_data)  # Return the parsed data as JSON
+    else:
+        return jsonify([])  # Return an empty array if no data is found
+
+@app.route('/cancel_mine', methods=['POST'])
+def cancel_mine():
+    global mining_in_progress
+    mining_thread = app.config.get('mining_thread')  # Get the mining thread object
+    
+    if mining_thread:
+        mining_in_progress = False  # Set the flag to stop mining
+        mining_thread.join()  # Wait for the mining thread to complete
+        app.config['mining_thread'] = None  # Reset the thread object in the app's configuration
+        return jsonify({'message': 'Mining canceled', 'status': 200})
+    else:
+        return jsonify({'message': 'No mining in progress', 'status': 400})
 # ...
 
 if __name__ == '__main__':
+    app.config['mining_thread'] = None  # Initialize a variable to hold the mining thread
     app.run(host='0.0.0.0', port=6005, use_reloader=True)
